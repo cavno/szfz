@@ -63,7 +63,7 @@
 
         <div>
           <div class="flex items-center justify-between mb-2">
-            <label class="text-sm text-slate-600">查询周期 <span class="text-xs text-slate-400">(可多选;选 2 个及以上将显示折线对比图)</span></label>
+            <label class="text-sm text-slate-600">查询周期 <span class="text-xs text-slate-400">(可多选;选 2 个及以上将显示柱状+变动率双轴对比图)</span></label>
             <div class="flex gap-2">
               <button class="mini-btn" id="period-all-btn">全选</button>
               <button class="mini-btn" id="period-recent-btn">近 3 期</button>
@@ -366,81 +366,180 @@ function renderSinglePeriodView(period) {
   container.innerHTML = `<div class="grid grid-cols-1 ${gridCols} gap-4">${cards}</div>`;
 }
 
-// ===== Multi-period line chart view =====
-function drawLineChart({title, periods, datasets, unit, isInt}) {
-  const W = 520, H = 320;
-  const margin = {top: 38, right: 24, bottom: 64, left: 56};
+// ===== Multi-period combo chart (bars + % change line, dual y-axis) =====
+function drawComboChart({title, periods, datasets, unit, isInt}) {
+  const W = 540, H = 360;
+  const margin = {top: 42, right: 64, bottom: 76, left: 60};
   const innerW = W - margin.left - margin.right;
   const innerH = H - margin.top - margin.bottom;
 
-  const allValues = datasets.flatMap(d => d.values).filter(v => v !== null && v !== undefined && !isNaN(v));
-  if (allValues.length === 0) {
+  // ---- Compute % change of each selected period vs its NATURAL prior period
+  //      (one unit back in current granularity), regardless of whether that
+  //      prior period is selected. This ensures every selected period has a
+  //      trend point, including the first selected one.
+  function computePcts(values, priorValues) {
+    return values.map((v, i) => {
+      const prev = priorValues[i];
+      if (prev === null || prev === undefined || v === null || v === undefined ||
+          prev === 0 || isNaN(prev) || isNaN(v)) return null;
+      return (v - prev) / prev * 100;
+    });
+  }
+  const enriched = datasets.map(ds => ({
+    ...ds,
+    pcts: computePcts(ds.values, ds.priorValues || [])
+  }));
+
+  // ---- Primary (left) axis: bar values ----
+  const allBarValues = datasets.flatMap(d => d.values).filter(v => v !== null && v !== undefined && !isNaN(v));
+  if (allBarValues.length === 0) {
     return `<div class="text-slate-400 text-sm text-center py-16">${title}<br/><span class="text-xs">无数据</span></div>`;
   }
-  let yMin = Math.min(...allValues), yMax = Math.max(...allValues);
-  const yRange = yMax - yMin || Math.abs(yMax) || 1;
-  yMin -= yRange * 0.12;
-  yMax += yRange * 0.12;
-  if (yMin > 0 && (yMax - yMin) / yMax > 0.95) yMin = 0;
+  const rawMin = Math.min(...allBarValues), rawMax = Math.max(...allBarValues);
+  let y1Min = 0, y1Max = rawMax;
+  if (rawMin > 0 && rawMin / rawMax > 0.7) {
+    y1Min = rawMin - (rawMax - rawMin) * 0.25;
+  }
+  y1Max += (y1Max - y1Min) * 0.10;
+  if (y1Max === y1Min) y1Max = y1Min + 1;
 
-  const xPos = i => periods.length === 1 ? margin.left + innerW/2 : margin.left + (i / (periods.length - 1)) * innerW;
-  const yPos = v => margin.top + (1 - (v - yMin) / (yMax - yMin)) * innerH;
+  // ---- Secondary (right) axis: % change, symmetric around 0, rounded to nice number ----
+  const allPcts = enriched.flatMap(d => d.pcts).filter(v => v !== null && v !== undefined && !isNaN(v));
+  let absMax = allPcts.length > 0 ? Math.max(...allPcts.map(Math.abs)) : 10;
+  const niceSteps = [5, 10, 15, 20, 25, 30, 50, 75, 100, 150, 200, 300, 500];
+  absMax = niceSteps.find(s => s >= absMax) || Math.ceil(absMax / 100) * 100;
+  const y2Min = -absMax, y2Max = absMax;
+
+  // ---- Layout ----
+  const groupCount = periods.length;
+  const groupSlot = innerW / groupCount;
+  const groupPad = 0.18;
+  const groupInner = groupSlot * (1 - groupPad);
+  const barCount = datasets.length;
+  const barGap = barCount > 1 ? Math.min(2, groupInner / barCount * 0.12) : 0;
+  const barWidth = Math.max(2, (groupInner - barGap * (barCount - 1)) / barCount);
+
+  const groupLeft = gi => margin.left + gi * groupSlot + (groupSlot - groupInner) / 2;
+  const groupCenter = gi => groupLeft(gi) + groupInner / 2;
+  const y1Pos = v => margin.top + (1 - (v - y1Min) / (y1Max - y1Min)) * innerH;
+  const y2Pos = v => margin.top + (1 - (v - y2Min) / (y2Max - y2Min)) * innerH;
 
   let svg = `<svg viewBox="0 0 ${W} ${H}" class="w-full h-auto" xmlns="http://www.w3.org/2000/svg">`;
   svg += `<text x="${W/2}" y="22" text-anchor="middle" font-size="14" font-weight="600" fill="#334155">${title}</text>`;
 
+  // Y1 (left) - gridlines + labels
   const ySteps = 5;
   for (let i = 0; i <= ySteps; i++) {
-    const v = yMin + (yMax - yMin) * (1 - i / ySteps);
+    const v = y1Min + (y1Max - y1Min) * (1 - i / ySteps);
     const y = margin.top + (i / ySteps) * innerH;
     svg += `<line x1="${margin.left}" y1="${y}" x2="${margin.left + innerW}" y2="${y}" stroke="#e2e8f0" stroke-width="1" />`;
     const labelV = isInt ? Math.round(v) : (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1));
-    svg += `<text x="${margin.left - 8}" y="${y + 4}" text-anchor="end" font-size="10" fill="#64748b">${labelV}</text>`;
+    svg += `<text x="${margin.left - 6}" y="${y + 4}" text-anchor="end" font-size="10" fill="#64748b">${labelV}</text>`;
   }
 
-  periods.forEach((p, i) => {
-    const x = xPos(i);
-    svg += `<text x="${x}" y="${margin.top + innerH + 18}" text-anchor="end" font-size="10" fill="#64748b" transform="rotate(-35 ${x} ${margin.top + innerH + 18})">${p.label}</text>`;
-  });
+  // Y2 (right) - labels (dashed gridline only at 0)
+  for (let i = 0; i <= ySteps; i++) {
+    const v = y2Min + (y2Max - y2Min) * (1 - i / ySteps);
+    const y = margin.top + (i / ySteps) * innerH;
+    const sign = v > 0 ? "+" : "";
+    svg += `<text x="${margin.left + innerW + 6}" y="${y + 4}" text-anchor="start" font-size="10" fill="#94a3b8">${sign}${v.toFixed(0)}%</text>`;
+  }
 
-  svg += `<line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${margin.top + innerH}" stroke="#cbd5e1" stroke-width="1.5" />`;
-  svg += `<line x1="${margin.left}" y1="${margin.top + innerH}" x2="${margin.left + innerW}" y2="${margin.top + innerH}" stroke="#cbd5e1" stroke-width="1.5" />`;
+  // Zero-% reference line (dashed)
+  const zeroPctY = y2Pos(0);
+  if (zeroPctY >= margin.top && zeroPctY <= margin.top + innerH) {
+    svg += `<line x1="${margin.left}" y1="${zeroPctY}" x2="${margin.left + innerW}" y2="${zeroPctY}" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4,3" />`;
+  }
 
-  datasets.forEach(ds => {
-    let path = '', inSegment = false;
-    ds.values.forEach((v, i) => {
-      if (v === null || v === undefined || isNaN(v)) { inSegment = false; return; }
-      const x = xPos(i), y = yPos(v);
-      path += (inSegment ? 'L ' : 'M ') + `${x} ${y} `;
-      inSegment = true;
-    });
-    if (path) svg += `<path d="${path}" fill="none" stroke="${ds.color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />`;
-    ds.values.forEach((v, i) => {
+  // Axis labels at top
+  svg += `<text x="${margin.left - 6}" y="${margin.top - 10}" text-anchor="end" font-size="9" fill="#94a3b8">柱·${unit}</text>`;
+  svg += `<text x="${margin.left + innerW + 6}" y="${margin.top - 10}" text-anchor="start" font-size="9" fill="#94a3b8">线·%</text>`;
+
+  // Bars + period labels
+  const baselineY = y1Pos(y1Min);
+  periods.forEach((p, gi) => {
+    const gLeft = groupLeft(gi);
+    datasets.forEach((ds, di) => {
+      const v = ds.values[gi];
       if (v === null || v === undefined || isNaN(v)) return;
-      const x = xPos(i), y = yPos(v);
+      const x = gLeft + di * (barWidth + barGap);
+      const yTop = y1Pos(v);
+      const h = Math.max(0, baselineY - yTop);
       const valStr = isInt ? Math.round(v) : v.toFixed(1);
-      svg += `<circle cx="${x}" cy="${y}" r="4" fill="${ds.color}" stroke="white" stroke-width="2"><title>${ds.label} · ${periods[i].label}: ${valStr}${unit}</title></circle>`;
+      svg += `<rect x="${x}" y="${yTop}" width="${barWidth}" height="${h}" fill="${ds.color}" fill-opacity="0.78" rx="1.5"><title>${ds.label} · ${p.label}: ${valStr}${unit}</title></rect>`;
+    });
+    const xc = gLeft + groupInner / 2;
+    svg += `<text x="${xc}" y="${margin.top + innerH + 18}" text-anchor="end" font-size="10" fill="#64748b" transform="rotate(-35 ${xc} ${margin.top + innerH + 18})">${p.label}</text>`;
+  });
+
+  // Trend lines for % change - one per dataset
+  enriched.forEach(ds => {
+    let path = "", inSeg = false;
+    ds.pcts.forEach((v, i) => {
+      if (v === null || v === undefined || isNaN(v)) { inSeg = false; return; }
+      const x = groupCenter(i), y = y2Pos(v);
+      path += (inSeg ? "L " : "M ") + `${x} ${y} `;
+      inSeg = true;
+    });
+    if (path) {
+      svg += `<path d="${path}" fill="none" stroke="${ds.color}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" />`;
+    }
+    ds.pcts.forEach((v, i) => {
+      if (v === null || v === undefined || isNaN(v)) return;
+      const x = groupCenter(i), y = y2Pos(v);
+      const sign = v >= 0 ? "+" : "";
+      const priorLabel = ds.priorLabels?.[i] || "上期";
+      svg += `<circle cx="${x}" cy="${y}" r="3.8" fill="white" stroke="${ds.color}" stroke-width="2"><title>${ds.label} · ${periods[i].label} vs ${priorLabel} 环比变动: ${sign}${v.toFixed(1)}%</title></circle>`;
     });
   });
+
+  // Axes lines
+  svg += `<line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${margin.top + innerH}" stroke="#cbd5e1" stroke-width="1.5" />`;
+  svg += `<line x1="${margin.left + innerW}" y1="${margin.top}" x2="${margin.left + innerW}" y2="${margin.top + innerH}" stroke="#cbd5e1" stroke-width="1.5" />`;
+  svg += `<line x1="${margin.left}" y1="${baselineY}" x2="${margin.left + innerW}" y2="${baselineY}" stroke="#94a3b8" stroke-width="1.5" />`;
+
+  if (y1Min > 0) {
+    svg += `<text x="${margin.left - 6}" y="${baselineY + 11}" font-size="8" fill="#94a3b8" text-anchor="end">基线 ${isInt ? Math.round(y1Min) : y1Min.toFixed(0)}</text>`;
+  }
+
   svg += `</svg>`;
 
-  let legend = `<div class="flex flex-wrap gap-3 justify-center text-xs text-slate-600 mt-1">`;
+  // Legend - communities + glyph explanation
+  let legend = `<div class="text-xs text-slate-600 mt-1 space-y-1">`;
+  legend += `<div class="flex flex-wrap gap-3 justify-center">`;
   datasets.forEach(ds => {
-    legend += `<span class="inline-flex items-center gap-1.5"><span class="inline-block w-4 h-1 rounded" style="background:${ds.color}"></span>${ds.label}</span>`;
+    legend += `<span class="inline-flex items-center gap-1.5"><span class="inline-block w-3 h-3 rounded-sm" style="background:${ds.color};opacity:0.78"></span>${ds.label}</span>`;
   });
   legend += `</div>`;
+  legend += `<div class="flex flex-wrap gap-4 justify-center text-slate-400 pt-0.5">`;
+  legend += `<span class="inline-flex items-center gap-1.5"><span class="inline-block w-3 h-3 rounded-sm bg-slate-400" style="opacity:0.78"></span>柱:绝对值 (左轴)</span>`;
+  legend += `<span class="inline-flex items-center gap-1.5"><svg width="22" height="8"><line x1="1" y1="4" x2="21" y2="4" stroke="#64748b" stroke-width="2"/><circle cx="11" cy="4" r="2.5" fill="white" stroke="#64748b" stroke-width="1.8"/></svg>线:环比变动率 (右轴)</span>`;
+  legend += `</div></div>`;
+
   return svg + legend;
 }
 
 function buildDatasetsForMetric(matrix, periods, communities, metricGetter) {
-  return communities.map((c, i) => ({
-    label: c,
-    color: COMMUNITY_COLORS[COMMUNITIES.indexOf(c) % COMMUNITY_COLORS.length],
-    values: periods.map(p => {
-      const cell = matrix[p.value][c];
+  return communities.map((c, i) => {
+    const values = periods.map(p => {
+      const cell = matrix[p.value]?.[c];
       return cell ? metricGetter(cell) : null;
-    })
-  }));
+    });
+    const priorPeriods = periods.map(p => prevQoQPeriod(p));
+    const priorValues = priorPeriods.map(pp => {
+      if (!pp) return null;
+      const cell = matrix[pp.value]?.[c];
+      return cell ? metricGetter(cell) : null;
+    });
+    const priorLabels = priorPeriods.map(pp => pp ? pp.label : null);
+    return {
+      label: c,
+      color: COMMUNITY_COLORS[COMMUNITIES.indexOf(c) % COMMUNITY_COLORS.length],
+      values,
+      priorValues,
+      priorLabels
+    };
+  });
 }
 
 function renderMultiPeriodView(periods) {
@@ -448,14 +547,25 @@ function renderMultiPeriodView(periods) {
   info.innerHTML = `共选 <strong>${periods.length}</strong> 个周期对比: ${periods.map(p => p.label).join(" · ")}`;
 
   const communities = getSelectedCommunities();
+
+  // Build matrix for selected periods PLUS each one's natural prior period
+  // (so every selected period can show a real "环比" change, even the first)
+  const periodMap = new Map();
+  periods.forEach(p => periodMap.set(p.value, p));
+  periods.forEach(p => {
+    const prior = prevQoQPeriod(p);
+    if (prior && !periodMap.has(prior.value)) periodMap.set(prior.value, prior);
+  });
+  const selectedKeys = new Set(periods.map(p => p.value));
+
   const matrix = {};
   let totalRecords = 0;
-  periods.forEach(p => {
-    matrix[p.value] = {};
+  periodMap.forEach((p, key) => {
+    matrix[key] = {};
     const recs = filterRecords(p);
-    totalRecords += recs.length;
+    if (selectedKeys.has(key)) totalRecords += recs.length;
     communities.forEach(c => {
-      matrix[p.value][c] = computeForCommunity(recs.filter(r => r["小区"] === c));
+      matrix[key][c] = computeForCommunity(recs.filter(r => r["小区"] === c));
     });
   });
 
@@ -479,7 +589,7 @@ function renderMultiPeriodView(periods) {
 
   const chartCards = charts.map(ch => {
     const datasets = buildDatasetsForMetric(matrix, periods, communities, ch.getter);
-    return `<div class="bg-white rounded-lg border border-slate-200 p-4">${drawLineChart({title: ch.title, periods, datasets, unit: ch.unit, isInt: ch.isInt})}</div>`;
+    return `<div class="bg-white rounded-lg border border-slate-200 p-4">${drawComboChart({title: ch.title, periods, datasets, unit: ch.unit, isInt: ch.isInt})}</div>`;
   }).join("");
 
   // Detail table
